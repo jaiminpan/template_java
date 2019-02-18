@@ -75,18 +75,21 @@ public class AiProducer {
 		}
 	}
 
-	public void send(String topic, String key, String message) {
+	public boolean send(String topic, String key, String message) {
 		Producer<String, String> producer = topicMap.get(topic);
 		if (producer == null) {
 			LOGGER.info("Producer not init");
-			return;
+			return false;
 		}
 
 		try {
 			RecordMetadata ret = producer.send(new ProducerRecord<String, String>(topic, key, message)).get();
 		} catch (Exception e) {
 			LOGGER.error("kafka write failed", e);
+			return false;
 		}
+
+		return true;
 	}
 
 	public static void main(String[] args) {
