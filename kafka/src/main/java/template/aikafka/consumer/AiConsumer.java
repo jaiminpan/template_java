@@ -1,12 +1,7 @@
 package template.aikafka.consumer;
 
 import java.time.Instant;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Optional;
-import java.util.Properties;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -23,6 +18,7 @@ import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndTimestamp;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.errors.WakeupException;
 
 import static java.time.temporal.ChronoUnit.MINUTES;
@@ -188,14 +184,14 @@ public class AiConsumer {
 			}
 
 			consumer.subscribe(Collections.singletonList(topic));
+
 			Thread thread = new Thread(() -> {
 				ConsumerHandler handler = null;
 				while (true) {
 					ConsumerRecords<String, Object> records = consumer.poll(timeout);
 					//reset offset
 					Set<TopicPartition> assignments = consumer.assignment();
-					assignments.forEach(topicPartition ->consumer.seekToBeginning(
-							Collections.singletonList(topicPartition)));
+					assignments.forEach(topicPartition ->consumer.seekToBeginning(Collections.singletonList(topicPartition)));
 
 					for (ConsumerRecord<String, Object> record : records) {
 						try {
@@ -219,7 +215,7 @@ public class AiConsumer {
 	/**
 	 * Consume from latest offset
 	 */
-	public void consumeFromLastest(String topic, Class<? extends ConsumerHandler> clazz) {
+	public void consumeForLastest(String topic, Class<? extends ConsumerHandler> clazz) {
 		try{
 			KafkaConsumer<String, Object> consumer = topicMap.get(topic);
 			if (consumer == null) {
@@ -255,7 +251,7 @@ public class AiConsumer {
 		}
 	}
 
-	public void consumeFromTimes(String topic, int minute, ConsumerHandler handler) {
+	public void consumeForTimes(String topic, int minute, ConsumerHandler handler) {
 		try{
 			KafkaConsumer<String, Object> consumer = topicMap.get(topic);
 			if (consumer == null) {
@@ -263,21 +259,7 @@ public class AiConsumer {
 				return;
 			}
 
-			consumer.subscribe(Collections.singletonList(topic));
-
-			Set<TopicPartition> assignments = consumer.assignment();
-			Map<TopicPartition, Long> query = new HashMap<>();
-			for (TopicPartition topicPartition : assignments) {
-				//在每一分区上寻找对应的offset
-				query.put(topicPartition, Instant.now().minus(minute, MINUTES).toEpochMilli());
-			}
-			Map<TopicPartition, OffsetAndTimestamp> result = consumer.offsetsForTimes(query);
-			//根据找到的offset修改,没有则从最新的offset开始
-			result.entrySet().stream().forEach(entry ->
-					consumer.seek(entry.getKey(), Optional.ofNullable(entry.getValue())
-							.map(OffsetAndTimestamp::offset)
-							.orElse(new Long(Long.MAX_VALUE)))
-			);
+			assignForTimes(consumer, topic, minute);
 
 			Thread thread = new Thread(() -> {
 				while (true) {
@@ -301,43 +283,86 @@ public class AiConsumer {
 		}
 	}
 
+	/*
+	 * Auto-balance group
+	 * subscribe: topic management (auto group)
+	 */
+	private void subscribeForTimes(KafkaConsumer<String, Object> consumer,
+	                               String topic, int minute) {
+
+		consumer.subscribe(Collections.singletonList(topic));
+
+		Set<TopicPartition> topicPartitions = consumer.assignment();
+		Map<TopicPartition, Long> timesToQuery = new HashMap<>();
+
+		long beginTime = Instant.now().minus(minute, MINUTES).toEpochMilli();
+
+		for (TopicPartition topicPartition : topicPartitions) {
+			//在每一分区上寻找对应的offset
+			timesToQuery.put(topicPartition, beginTime);
+		}
+
+		Map<TopicPartition, OffsetAndTimestamp> result = consumer.offsetsForTimes(timesToQuery);
+		//根据找到的offset修改,没有则从最新的offset开始
+		result.entrySet().stream().forEach(entry ->
+				consumer.seek(entry.getKey(), Optional.ofNullable(entry.getValue())
+						.map(OffsetAndTimestamp::offset)
+						.orElse(new Long(Long.MAX_VALUE)))
+		);
+	}
+
+	/*
+	 * No Re-balance
+	 * this method does not use the consumer's group management
+	 * assign: topic-partition management（use group manage）；
+	 */
+	private void assignForTimes(KafkaConsumer<String, Object> consumer,
+	                            String topic, int minute) {
+
+		List<TopicPartition> topicPartitions = new ArrayList<>();
+		Map<TopicPartition, Long> timesToQuery = new HashMap<>();
+
+		// 获取每个partition之前的偏移量
+		long beginTime = Instant.now().minus(minute, MINUTES).toEpochMilli();
+
+		// 获取topic的partition信息
+		List<PartitionInfo> partitionInfos = consumer.partitionsFor(topic);
+
+		for (PartitionInfo partitionInfo : partitionInfos) {
+			topicPartitions.add(new TopicPartition(partitionInfo.topic(), partitionInfo.partition()));
+			timesToQuery.put(new TopicPartition(partitionInfo.topic(), partitionInfo.partition()), beginTime);
+		}
+
+		consumer.assign(topicPartitions);
+
+		Map<TopicPartition, OffsetAndTimestamp> result = consumer.offsetsForTimes(timesToQuery);
+		//根据找到的offset修改,没有则从最新的offset开始
+		result.entrySet().stream().forEach(entry ->
+				consumer.seek(entry.getKey(), Optional.ofNullable(entry.getValue())
+						.map(OffsetAndTimestamp::offset)
+						.orElse(new Long(Long.MAX_VALUE)))
+		);
+	}
+
 	public static void main(String[] args) {
 
+		String kafka = "47.97.7.138:9092,47.97.5.96:9092,47.97.9.120:9092";
+		String clientId = "testclient2";
+		String group = "testclient2";
+
+		String topic = "topic_metric_tracking";
+
+		AiConsumer consumer = new AiConsumer();
+		consumer.init(kafka, topic, clientId, group);
 		try{
-			Properties props = new Properties();
-			props.put(ConsumerConfig.GROUP_ID_CONFIG, "testclient2");
-			props.put(ConsumerConfig.CLIENT_ID_CONFIG, "testclient2");
-			props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "47.97.7.138:9092,47.97.5.96:9092,47.97.9.120:9092");
-			props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "true");
 
-			//1.0.0
-			//props.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG,"read_committed");
-			props.put(ConsumerConfig.AUTO_COMMIT_INTERVAL_MS_CONFIG, "1000");
-			props.put(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG, "30000");
-			props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG,
-					"org.apache.kafka.common.serialization.StringDeserializer");
-			props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG,
-					"org.apache.kafka.common.serialization.StringDeserializer");
+			consumer.consume(topic, (record) ->
+					System.out.println(String.format("time:%d, partition:%d, record:%d", System.currentTimeMillis(), record.partition(), record.value()))
+			);
 
-			KafkaConsumer<String, Object> consumer = new KafkaConsumer<>(props);
-			LOGGER.info("消费端初始化");
-			consumer.subscribe(Collections.singletonList("topic_metric_tracking"));
-			LOGGER.info("消费端开始消费" + "topic_metric_tracking");
-			Thread thread = new Thread(() -> {
-				while (true) {
-					ConsumerRecords<String, Object> records = consumer.poll(1000);
-
-					for (ConsumerRecord<String, Object> record : records) {
-						System.out.println("time:"+System.currentTimeMillis()+",partition:"+record.partition()+",record:" + record.value());
-					}
-				}
-			});
-			thread.setDaemon(true);
-			thread.start();
-			Thread.currentThread().join();
-		}catch(Exception e){
-			e.printStackTrace();
-			LOGGER.error("消费端初始化异常");
+			Thread.sleep(1000 * 10);
+		} catch(Exception e){
+			LOGGER.error("消费端初始化异常", e);
 		}
 	}
 }
